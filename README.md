@@ -9,7 +9,7 @@ This repository contains a CUDA implementation of the attention mechanism (forwa
 Profiling was done with Nsight Compute on an NVIDIA GeForce RTX 4080 SUPER. The dimensions used for `Q`, `K`, and `V` are 4096 x 1024.
 
 `naive_attention.cu`: 219.09 ms
-`fast_attention.cu`: 4.06 ms
+`fast_attention.cu`: 3.71 ms
 
 # Optimizations
 - `matrix_transpose`: Divided the input matrix into tiles, each loaded into shared memory. Block indices are maintained to ensure coalesced global memory reads/writes, and the shared memory tile is padded to avoid bank conflicts. This reduces global memory latency and improves throughput.
@@ -34,3 +34,4 @@ python test_correctness.py out
 - [Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867)
 - [Learning CUDA by optimizing softmax: A worklog](https://maharshi.bearblog.dev/optimizing-softmax-cuda/)
 - [An Efficient Matrix Transpose in CUDA C/C++](https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/)
+- [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog](https://siboehm.com/articles/22/CUDA-MMM)

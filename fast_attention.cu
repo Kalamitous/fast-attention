@@ -14,13 +14,13 @@ const int M = 4096;
 const int d = 1024;
 
 // transpose parameters
-const int TILE_DIM = 32;
-const int BLOCK_ROWS = TILE_DIM / 4;
+const int TILE_DIM = 64;
+const int BLOCK_ROWS = TILE_DIM / 8;
 
 // matrix multiply parameters
-const int BN = 64;
-const int BM = 64;
-const int Bd = 8;
+const int BN = 128;
+const int BM = 128;
+const int Bd = 16;
 const int TN = 8;
 const int TM = 8;
 
