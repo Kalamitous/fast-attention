@@ -63,8 +63,9 @@ __global__ void matrix_multiply(
     float* C,
     int N, int M, int d
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    // ensure memory coalescing by mapping columns to the horizontal axis
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= N || col >= M) return;
 
     float sum = 0.0f;
@@ -194,7 +195,7 @@ void attention(
     cudaDeviceSynchronize();
 
     dim3 blockDim2(32, 32);
-    dim3 gridDim2(CEIL_DIV(N, blockDim2.x), CEIL_DIV(M, blockDim2.y));
+    dim3 gridDim2(CEIL_DIV(M, blockDim2.x), CEIL_DIV(N, blockDim2.y));
     matrix_multiply<<<gridDim2, blockDim2>>>(Q, K_T, scores, N, M, d);
     cudaDeviceSynchronize();
 
@@ -210,7 +211,7 @@ void attention(
     cudaDeviceSynchronize();
 
     dim3 blockDim5(32, 32);
-    dim3 gridDim5(CEIL_DIV(N, blockDim5.x), CEIL_DIV(d, blockDim5.y));
+    dim3 gridDim5(CEIL_DIV(d, blockDim5.x), CEIL_DIV(N, blockDim5.y));
     matrix_multiply<<<gridDim5, blockDim5>>>(scores, V, O, N, d, M);
     cudaDeviceSynchronize();
 
