@@ -1,3 +1,4 @@
+#include <cassert>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -15,6 +16,13 @@ const int d = 1024;
 // transpose parameters
 const int TILE_DIM = 32;
 const int BLOCK_ROWS = TILE_DIM / 4;
+
+// matrix multiply parameters
+const int BN = 64;
+const int BM = 64;
+const int Bd = 8;
+const int TN = 8;
+const int TM = 8;
 
 // transposes src into dst
 // ref: https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
@@ -57,22 +65,85 @@ __global__ void matrix_transpose(
 }
 
 // C = A * B
+// ref: https://siboehm.com/articles/22/CUDA-MMM
+template <const int BN, const int BM, const int Bd, const int TN, const int TM>
 __global__ void matrix_multiply(
     const float* A,
     const float* B,
     float* C,
     int N, int M, int d
 ) {
-    // ensure memory coalescing by mapping columns to the horizontal axis
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= N || col >= M) return;
+    // calculate indices
+    int outer_row = blockIdx.y;
+    int outer_col = blockIdx.x;
 
-    float sum = 0.0f;
-    for (int i = 0; i < d; ++i) {
-        sum += A[row * d + i] * B[i * M + col];
+    int num_threads = (BN * BM) / (TN * TM);
+    assert(num_threads == blockDim.x);
+    
+    int inner_row_a = threadIdx.x / Bd;
+    int inner_col_a = threadIdx.x % Bd;
+    int stride_a = num_threads / Bd;
+
+    int inner_row_b = threadIdx.x / BM;
+    int inner_col_b = threadIdx.x % BM;
+    int stride_b = num_threads / BM;
+
+    int thread_row = threadIdx.x / (BM / TM);
+    int thread_col = threadIdx.x % (BM / TM);
+
+    // allocate space for a block tile in smem 
+    __shared__ float As[BN * Bd];
+    __shared__ float Bs[Bd * BM];
+
+    // allocate space for a thread tile in registers
+    float Ar[TN] = {0.0f};
+    float Br[TM] = {0.0f};
+    float Cr[TN * TM] = {0.0f};
+
+    // point to the first block tile
+    A += outer_row * BN * d;
+    B += outer_col * BM;
+    C += outer_row * BN * M + outer_col * BM;
+
+    // iterate through block tiles
+    for (int block = 0; block < d; block += Bd) {
+        // copy block tile to smem
+        for (int i = 0; i < BN; i += stride_a) {
+            As[(inner_row_a + i) * Bd + inner_col_a] = A[(inner_row_a + i) * d + inner_col_a];
+        }
+        for (int i = 0; i < Bd; i += stride_b) {
+            Bs[(inner_row_b + i) * BM + inner_col_b] = B[(inner_row_b + i) * M + inner_col_b];
+        }
+        __syncthreads();
+
+        // advance to next block tile
+        A += Bd;
+        B += Bd * M;
+
+        for (int dot_idx = 0; dot_idx < Bd; ++dot_idx) {
+            // copy thread tile to registers
+            for (int row = 0; row < TN; ++row) {
+                Ar[row] = As[(thread_row * TN + row) * Bd + dot_idx];
+            }
+            for (int col = 0; col < TM; ++col) {
+                Br[col] = Bs[dot_idx * BM + thread_col * TM + col];
+            }
+            // compute dot products
+            for (int row = 0; row < TN; ++row) {
+                for (int col = 0; col < TM; ++col) {
+                    Cr[row * TM + col] += Ar[row] * Br[col];
+                }
+            }
+        }
+        __syncthreads();
     }
-    C[row * M + col] = sum;
+
+    // write per-thread results to gmem
+    for (int row = 0; row < TN; ++row) {
+        for (int col = 0; col < TM; ++col) {
+            C[(thread_row * TN + row) * M + thread_col * TM + col] = Cr[row * TM + col];
+        }
+    }
 }
 
 // divides array by value in place
@@ -194,9 +265,10 @@ void attention(
     matrix_transpose<TILE_DIM, BLOCK_ROWS><<<gridDim1, blockDim1>>>(K, K_T, M, d);
     cudaDeviceSynchronize();
 
-    dim3 blockDim2(32, 32);
-    dim3 gridDim2(CEIL_DIV(M, blockDim2.x), CEIL_DIV(N, blockDim2.y));
-    matrix_multiply<<<gridDim2, blockDim2>>>(Q, K_T, scores, N, M, d);
+    int num_threads = (BN * BM) / (TN * TM);
+    dim3 blockDim2(num_threads);
+    dim3 gridDim2(CEIL_DIV(M, BM), CEIL_DIV(N, BN));
+    matrix_multiply<BN, BM, Bd, TN, TM><<<gridDim2, blockDim2>>>(Q, K_T, scores, N, M, d);
     cudaDeviceSynchronize();
 
     dim3 blockDim3(1024);
@@ -210,9 +282,9 @@ void attention(
     matrix_softmax<<<gridDim4, blockDim4, shared_bytes>>>(scores, N, M);
     cudaDeviceSynchronize();
 
-    dim3 blockDim5(32, 32);
-    dim3 gridDim5(CEIL_DIV(d, blockDim5.x), CEIL_DIV(N, blockDim5.y));
-    matrix_multiply<<<gridDim5, blockDim5>>>(scores, V, O, N, d, M);
+    dim3 blockDim5(num_threads);
+    dim3 gridDim5(CEIL_DIV(d, BM), CEIL_DIV(N, BN));
+    matrix_multiply<BN, BM, Bd, TN, TM><<<gridDim5, blockDim5>>>(scores, V, O, N, d, M);
     cudaDeviceSynchronize();
 
     cudaFree(K_T);
