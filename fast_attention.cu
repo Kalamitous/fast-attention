@@ -6,21 +6,54 @@
 
 #define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
 
+const int WARP_SIZE = 32;
+
 const int N = 4096;
 const int M = 4096;
 const int d = 1024;
 
+// transpose parameters
+const int TILE_DIM = 32;
+const int BLOCK_ROWS = TILE_DIM / 4;
+
 // transposes src into dst
+// ref: https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
+template <const int TILE_DIM, const int BLOCK_ROWS>
 __global__ void matrix_transpose(
     const float* src,
     float* dst,
     int N, int M
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int col = blockIdx.y * blockDim.y + threadIdx.y;
-    if (row >= N || col >= M) return;
+    static_assert(TILE_DIM % BLOCK_ROWS == 0, "TILE_DIM must be divisible by BLOCK_ROWS");
 
-    dst[col * N + row] = src[row * M + col];
+    // ensure memory coalescing by mapping columns to the horizontal axis
+    int row = blockIdx.y * TILE_DIM + threadIdx.y;
+    int col = blockIdx.x * TILE_DIM + threadIdx.x;
+
+    int thread_row = threadIdx.y;
+    int thread_col = threadIdx.x;
+
+    // pad width to avoid bank conflicts when
+    // accessing the same column in different rows
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+    // copy tile into smem
+    for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
+        if ((row + i) < N && col < M) {
+            tile[thread_row + i][thread_col] = src[(row + i) * M + col];
+        }
+    }
+    __syncthreads();
+
+    // transpose global indices
+    row = blockIdx.x * TILE_DIM + threadIdx.y;
+    col = blockIdx.y * TILE_DIM + threadIdx.x;
+
+    // transpose from smem
+    for (int i = 0; i < TILE_DIM; i += BLOCK_ROWS) {
+        if ((row + i) < M && col < N) {
+            dst[(row + i) * N + col] = tile[thread_col][thread_row + i];
+        }
+    }
 }
 
 // C = A * B
@@ -66,8 +99,6 @@ __global__ void matrix_softmax(
     int tid = threadIdx.x;
     if (row >= N) return;
 
-    int warp_size = 32;
-
     // perform online softmax which fuses the step of finding the local max
     // and the step of computing the local denominator
     float local_max = -CUDART_INF_F;
@@ -85,22 +116,22 @@ __global__ void matrix_softmax(
 
     // warp-level reduction via warp shuffling
     float val = local_max;
-    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
         val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
     }
     // now the first thread in each warp has its local max
-    if (blockDim.x > warp_size) {
+    if (blockDim.x > WARP_SIZE) {
         // block-level reduction on the first thread of each warp
-        if (tid % warp_size == 0){
-            smem[tid / warp_size] = val;
+        if (tid % WARP_SIZE == 0){
+            smem[tid / WARP_SIZE] = val;
         }
         __syncthreads();
         // now the first warp holds all local maxes
-        if (tid < warp_size) {
+        if (tid < WARP_SIZE) {
             // warp-level reduction on the first warp
-            // there are CEIL_DIV(blockDim.x, warp_size) local maxes
-            val = (tid < CEIL_DIV(blockDim.x, warp_size)) ? smem[tid] : -CUDART_INF_F;
-            for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+            // there are CEIL_DIV(blockDim.x, WARP_SIZE) local maxes
+            val = (tid < CEIL_DIV(blockDim.x, WARP_SIZE)) ? smem[tid] : -CUDART_INF_F;
+            for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
                 val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
             }
             // now the first thread holds the global max
@@ -116,17 +147,17 @@ __global__ void matrix_softmax(
     // repeat the reduction process to obtain the global denominator
     // correct the local denominator with the global max
     val = local_sum_exp * expf(local_max - global_max);
-    for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
         val += __shfl_down_sync(0xffffffff, val, offset);
     }
-    if (blockDim.x > warp_size) {
-        if (tid % warp_size == 0){
-            smem[tid / warp_size] = val;
+    if (blockDim.x > WARP_SIZE) {
+        if (tid % WARP_SIZE == 0){
+            smem[tid / WARP_SIZE] = val;
         }
         __syncthreads();
-        if (tid < warp_size) {
-            val = (tid < CEIL_DIV(blockDim.x, warp_size)) ? smem[tid] : 0.0f;
-            for (int offset = warp_size / 2; offset > 0; offset /= 2) {
+        if (tid < WARP_SIZE) {
+            val = (tid < CEIL_DIV(blockDim.x, WARP_SIZE)) ? smem[tid] : 0.0f;
+            for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
                 val += __shfl_down_sync(0xffffffff, val, offset);
             }
             if (tid == 0) smem[0] = val;
@@ -157,9 +188,9 @@ void attention(
     cudaMalloc(&K_T, d * M * sizeof(float));
     cudaMalloc(&scores, N * M * sizeof(float));
 
-    dim3 blockDim1(32, 32);
-    dim3 gridDim1(CEIL_DIV(M, blockDim1.x), CEIL_DIV(d, blockDim1.y));
-    matrix_transpose<<<gridDim1, blockDim1>>>(K, K_T, M, d);
+    dim3 blockDim1(TILE_DIM, BLOCK_ROWS);
+    dim3 gridDim1(CEIL_DIV(d, TILE_DIM), CEIL_DIV(M, TILE_DIM));
+    matrix_transpose<TILE_DIM, BLOCK_ROWS><<<gridDim1, blockDim1>>>(K, K_T, M, d);
     cudaDeviceSynchronize();
 
     dim3 blockDim2(32, 32);
