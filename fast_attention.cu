@@ -278,7 +278,7 @@ void attention(
 
     dim3 blockDim4(1024);
     dim3 gridDim4(N);
-    int shared_bytes = blockDim4.x * sizeof(float);
+    int shared_bytes = CEIL_DIV(blockDim4.x, WARP_SIZE) * sizeof(float);
     matrix_softmax<<<gridDim4, blockDim4, shared_bytes>>>(scores, N, M);
     cudaDeviceSynchronize();
 
